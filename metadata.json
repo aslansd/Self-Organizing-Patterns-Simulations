@@ -1,6 +1,0 @@
-{
-  "name": "Self-Organizing Patterns Simulation",
-  "description": "An interactive, playable exploration of self-organizing pattern formation and morphogenesis, showing Turing patterns and L-systems in an educational 3D environment.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
