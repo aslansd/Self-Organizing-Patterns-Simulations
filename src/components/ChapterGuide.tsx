@@ -1,5 +1,14 @@
-import React, { useState, useEffect } from 'react';
-import { ChevronRight, ChevronLeft, Check, Sparkles, AlertCircle, HelpCircle, RefreshCw, Trophy, BookOpen, Lightbulb } from 'lucide-react';
+import { useState, useEffect, useCallback } from 'react';
+import {
+  ChevronRight,
+  ChevronLeft,
+  Check,
+  AlertCircle,
+  RefreshCw,
+  Trophy,
+  BookOpen,
+  Lightbulb,
+} from 'lucide-react';
 import { TuringParameters, LSystemParameters, Chapter } from '../types';
 import TuringSim3D from './TuringSim3D';
 import LSystemSim3D from './LSystemSim3D';
@@ -11,6 +20,8 @@ interface ChapterGuideProps {
   onChangeLsystemParams: (p: LSystemParameters) => void;
 }
 
+const TOTAL_CHAPTERS = 7;
+
 export default function ChapterGuide({
   turingParams,
   onChangeTuringParams,
@@ -19,140 +30,220 @@ export default function ChapterGuide({
 }: ChapterGuideProps) {
   const [currentChapter, setCurrentChapter] = useState<number>(1);
   const [completedChapters, setCompletedChapters] = useState<Record<number, boolean>>({});
+  // Chapter 7 is a free sandbox: let the reader pick which engine to play with.
+  const [sandboxEngine, setSandboxEngine] = useState<'turing' | 'lsystem'>('turing');
 
-  // 1D Mini diffusion toy state (Chapter 1 & 2)
-  const [diffusionCells, setDiffusionCells] = useState<number[]>([0, 0, 0, 100, 0, 0, 0, 0, 0, 0]);
+  // ---------------------------------------------------------------------------
+  // 1D reaction-diffusion toy (Chapters 1 & 2)
+  //
+  // Chapter 1 shows PURE diffusion (mass spreads out and flattens).
+  // Chapter 2 turns the reaction on, so the reader can see the same diffusion
+  // step produce the opposite outcome once autocatalysis is present. That
+  // contrast is the whole point of Turing's 1952 argument, and the original
+  // version of this app asserted it in prose without ever demonstrating it.
+  // ---------------------------------------------------------------------------
+  const INITIAL_A = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+  const INITIAL_B = [0, 0, 0, 0.5, 0.5, 0, 0, 0, 0, 0];
 
-  // Handle stepping the 1D diffusion chain
-  const stepDiffusion1D = () => {
-    const nextCells = [...diffusionCells];
-    const rate = 0.3; // diffusion coefficient
-    for (let i = 0; i < diffusionCells.length; i++) {
-      const im1 = i === 0 ? diffusionCells.length - 1 : i - 1;
-      const ip1 = (i + 1) % diffusionCells.length;
+  const [cellsA, setCellsA] = useState<number[]>([...INITIAL_A]);
+  const [cellsB, setCellsB] = useState<number[]>([...INITIAL_B]);
+  const [stepCount, setStepCount] = useState<number>(0);
 
-      // laplacian in 1D is: cell[left] + cell[right] - 2 * cell[center]
-      const delta = rate * (diffusionCells[im1] + diffusionCells[ip1] - 2 * diffusionCells[i]);
-      nextCells[i] = Math.max(0, Math.min(100, diffusionCells[i] + delta));
+  const reactionOn = currentChapter === 2;
+
+  const step1D = () => {
+    const n = cellsA.length;
+    // Substrate A diffuses fast, activator B diffuses slowly - the essential asymmetry.
+    const dA = 0.4;
+    const dB = 0.1;
+    const f = 0.055;
+    const k = 0.062;
+
+    const nextA = [...cellsA];
+    const nextB = [...cellsB];
+
+    for (let i = 0; i < n; i++) {
+      const im1 = (i - 1 + n) % n;
+      const ip1 = (i + 1) % n;
+
+      // 1D Laplacian: left + right - 2 * centre
+      const lapA = cellsA[im1] + cellsA[ip1] - 2 * cellsA[i];
+      const lapB = cellsB[im1] + cellsB[ip1] - 2 * cellsB[i];
+
+      if (reactionOn) {
+        const abb = cellsA[i] * cellsB[i] * cellsB[i];
+        nextA[i] = Math.max(0, Math.min(1, cellsA[i] + dA * lapA - abb + f * (1 - cellsA[i])));
+        nextB[i] = Math.max(0, Math.min(1, cellsB[i] + dB * lapB + abb - (f + k) * cellsB[i]));
+      } else {
+        // Pure diffusion, no reaction: total mass is conserved and the profile flattens.
+        nextA[i] = cellsA[i];
+        nextB[i] = Math.max(0, Math.min(1, cellsB[i] + dA * lapB));
+      }
     }
-    setDiffusionCells(nextCells);
+
+    setCellsA(nextA);
+    setCellsB(nextB);
+    setStepCount((s) => s + 1);
   };
 
   const addConcentrationAt = (idx: number) => {
-    const nextCells = [...diffusionCells];
-    nextCells[idx] = Math.min(100, nextCells[idx] + 40);
-    setDiffusionCells(nextCells);
+    const next = [...cellsB];
+    next[idx] = Math.min(1, next[idx] + 0.4);
+    setCellsB(next);
+    if (reactionOn) {
+      const nextA = [...cellsA];
+      nextA[idx] = Math.max(0, nextA[idx] - 0.4);
+      setCellsA(nextA);
+    }
   };
 
-  const resetDiffusion1D = () => {
-    setDiffusionCells([0, 0, 0, 100, 0, 0, 0, 0, 0, 0]);
+  const reset1D = () => {
+    setCellsA([...INITIAL_A]);
+    setCellsB([...INITIAL_B]);
+    setStepCount(0);
   };
 
-  // Chapter evaluation parameters & completed indicators
-  const evaluateTuringMatch = (grid: number[][], expectedType: 'spots' | 'stripes') => {
-    if (!grid.length) return false;
+  // Reset the toy when moving between chapter 1 (diffusion) and 2 (reaction+diffusion)
+  useEffect(() => {
+    if (currentChapter === 1 || currentChapter === 2) reset1D();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentChapter]);
+
+  // Total activator mass - shown so the reader can see conservation vs. amplification.
+  const totalB = cellsB.reduce((s, v) => s + v, 0);
+
+  // ---------------------------------------------------------------------------
+  // Challenge evaluation
+  //
+  // A challenge is only satisfied when the SIMULATED FIELD actually shows the
+  // target morphology, not merely when a slider sits in a numeric range. The
+  // previous implementation marked chapters complete from parameter values
+  // alone (and computed a NaN variance from a malformed dummy grid).
+  // ---------------------------------------------------------------------------
+  const measureField = (grid: number[][]) => {
+    if (!grid.length || !Array.isArray(grid[0])) return null;
     let sum = 0;
     let sumSq = 0;
+    let active = 0;
     let total = 0;
     for (let x = 0; x < grid.length; x++) {
-      for (let y = 0; y < grid[x].length; y++) {
-        sum += grid[x][y];
-        sumSq += grid[x][y] * grid[x][y];
+      const col = grid[x];
+      for (let y = 0; y < col.length; y++) {
+        const v = col[y];
+        sum += v;
+        sumSq += v * v;
+        if (v > 0.2) active++;
         total++;
       }
     }
-    const average = sum / total;
-    const variance = (sumSq / total) - (average * average);
-
-    if (expectedType === 'spots') {
-      // Spots are represented by distinct clusters, moderate variance (e.g., between 1 and 12)
-      // And check if parameters match preset or similar ranges
-      const feedCorrect = turingParams.feed >= 0.030 && turingParams.feed <= 0.045;
-      const killCorrect = turingParams.kill >= 0.058 && turingParams.kill <= 0.065;
-      return (variance > 0.005 && variance < 0.04) && (feedCorrect || (turingParams.feed < 0.05));
-    } else {
-      // Stripes have higher continuous variance
-      const feedCorrect = turingParams.feed >= 0.048 && turingParams.feed <= 0.062;
-      const killCorrect = turingParams.kill >= 0.058 && turingParams.kill <= 0.066;
-      return (variance > 0.01) && feedCorrect;
-    }
+    if (!total) return null;
+    const mean = sum / total;
+    return { variance: sumSq / total - mean * mean, coverage: active / total };
   };
 
-  const evaluateLsystemMatch = (rules: { from: string; to: string }[], angle: number, expectedType: 'fern' | 'snowflake') => {
-    if (expectedType === 'fern') {
-      // Must contain branching grammar [ and ] and have an offset branch tilt
-      const hasBranches = rules.some(r => r.to.includes('[') && r.to.includes(']'));
-      const suitableAngle = angle >= 20 && angle <= 35;
-      return hasBranches && suitableAngle;
-    } else {
-      // Symmetrical geometry Koch or hexagonal snowflake angles (usually 45, 60 or 90)
-      const symmetricalAngle = angle === 60 || angle === 45 || angle === 90 || angle === 30;
-      return symmetricalAngle;
+  /** Count connected activator blobs (4-connectivity, periodic) on a coarsened grid. */
+  const countBlobs = (grid: number[][], stride = 2) => {
+    const w = Math.floor(grid.length / stride);
+    if (w < 8) return 0;
+    const mask: boolean[][] = [];
+    for (let x = 0; x < w; x++) {
+      mask[x] = [];
+      for (let y = 0; y < w; y++) mask[x][y] = grid[x * stride][y * stride] > 0.2;
     }
+    const seen: boolean[][] = mask.map((c) => c.map(() => false));
+    let blobs = 0;
+    let largest = 0;
+    let activeTotal = 0;
+    for (let x = 0; x < w; x++) for (let y = 0; y < w; y++) if (mask[x][y]) activeTotal++;
+
+    for (let x = 0; x < w; x++) {
+      for (let y = 0; y < w; y++) {
+        if (!mask[x][y] || seen[x][y]) continue;
+        blobs++;
+        let size = 0;
+        const stack: [number, number][] = [[x, y]];
+        seen[x][y] = true;
+        while (stack.length) {
+          const [cx, cy] = stack.pop()!;
+          size++;
+          const nb: [number, number][] = [
+            [(cx + 1) % w, cy],
+            [(cx - 1 + w) % w, cy],
+            [cx, (cy + 1) % w],
+            [cx, (cy - 1 + w) % w],
+          ];
+          for (const [nx, ny] of nb) {
+            if (mask[nx][ny] && !seen[nx][ny]) {
+              seen[nx][ny] = true;
+              stack.push([nx, ny]);
+            }
+          }
+        }
+        if (size > largest) largest = size;
+      }
+    }
+    return activeTotal ? (blobs >= 12 && largest < activeTotal * 0.35 ? blobs : 0) : 0;
   };
 
-  // Trigger completion indicators on successful states
-  const checkChampionshipProgress = () => {
-    if (currentChapter === 3) {
-      // Turing Spots Check
-      const matches = evaluateTuringMatch(Array(128).fill(0), 'spots'); // Checked inside the component primarily too
-      if (turingParams.feed <= 0.042 && turingParams.feed >= 0.032) {
-        setCompletedChapters(prev => ({ ...prev, 3: true }));
-      }
-    } else if (currentChapter === 4) {
-      if (turingParams.feed >= 0.050 && turingParams.feed <= 0.058 && turingParams.kill >= 0.060 && turingParams.kill <= 0.064) {
-        setCompletedChapters(prev => ({ ...prev, 4: true }));
-      }
-    } else if (currentChapter === 5) {
-      // Fern Chapter
-      const rules = lsystemParams.rules;
-      const hasBranchStr = rules.some(r => r.to.includes('[') && r.to.includes(']'));
-      if (hasBranchStr && lsystemParams.angle > 15 && lsystemParams.angle < 45) {
-        setCompletedChapters(prev => ({ ...prev, 5: true }));
-      }
-    } else if (currentChapter === 6) {
-      // Koch / symmetry
-      if (lsystemParams.angle === 60 || lsystemParams.angle === 45) {
-        setCompletedChapters(prev => ({ ...prev, 6: true }));
-      }
-    }
-  };
+  const evaluateTuringMatch = useCallback(
+    (grid: number[][], expected: 'spots' | 'ridges') => {
+      const m = measureField(grid);
+      if (!m) return false;
+      // Reject blank / saturated fields regardless of parameters.
+      if (m.coverage < 0.03 || m.coverage > 0.9 || m.variance < 0.004) return false;
 
-  // Auto monitor state changes to approve challenges
-  useEffect(() => {
-    checkChampionshipProgress();
-  }, [turingParams, lsystemParams, currentChapter]);
+      if (expected === 'spots') {
+        // Many small disconnected islands.
+        return countBlobs(grid) >= 12 && m.coverage < 0.55;
+      }
+      // Ridges: high coverage carried by few, large, connected components.
+      return countBlobs(grid) === 0 && m.coverage > 0.25;
+    },
+    [],
+  );
+
+  const evaluateLsystemMatch = useCallback(
+    (rules: { from: string; to: string }[], angle: number, expected: 'branching' | 'symmetric') => {
+      if (expected === 'branching') {
+        const hasBranches = rules.some((r) => r.to.includes('[') && r.to.includes(']'));
+        return hasBranches && angle >= 15 && angle <= 45;
+      }
+      // Koch snowflake: 60 deg, and a rule with no bracketed side-branches.
+      const noBranches = rules.every((r) => !r.to.includes('['));
+      return angle === 60 && noBranches;
+    },
+    [],
+  );
+
+  const markComplete = (n: number) =>
+    setCompletedChapters((prev) => (prev[n] ? prev : { ...prev, [n]: true }));
 
   // Navigation handlers
-  const handleNext = () => {
-    if (currentChapter < 7) {
-      setCurrentChapter(currentChapter + 1);
-    }
-  };
+  const handleNext = () => setCurrentChapter((c) => Math.min(TOTAL_CHAPTERS, c + 1));
+  const handlePrev = () => setCurrentChapter((c) => Math.max(1, c - 1));
+  const jumpToChapter = (id: number) => setCurrentChapter(id);
 
-  const handlePrev = () => {
-    if (currentChapter > 1) {
-      setCurrentChapter(currentChapter - 1);
-    }
-  };
-
-  const jumpToChapter = (id: number) => {
-    setCurrentChapter(id);
-  };
+  const chapter: Chapter = CHAPTERS[currentChapter - 1];
+  const showTuring = currentChapter <= 4 || (currentChapter === 7 && sandboxEngine === 'turing');
 
   return (
     <div className="flex flex-col lg:flex-row gap-6 w-full max-w-7xl mx-auto px-4 py-6" id="narrative-layout">
-      {/* LEFT COLUMN: Narrative Guide (Storybook / Nicky Case style card) */}
-      <div className="flex flex-col lg:w-5/12 bg-white rounded-3xl border border-stone-200/80 shadow-md p-6 sm:p-8 flex-shrink-0 flex-grow-0" id="chapter-narrative-card">
-        {/* Chapter Steps Indicator */}
-        <div className="flex items-center gap-1.5 mb-6 overflow-x-auto pb-2 scrollbar-none" id="chapters-nav-stepper">
-          {[1, 2, 3, 4, 5, 6, 7].map((num) => (
+      {/* LEFT COLUMN: Narrative guide */}
+      <div
+        className="flex flex-col lg:w-5/12 bg-white rounded-3xl border border-stone-200/80 shadow-md p-6 sm:p-8 flex-shrink-0 flex-grow-0"
+        id="chapter-narrative-card"
+      >
+        {/* Chapter stepper */}
+        <nav className="flex items-center gap-1.5 mb-6 overflow-x-auto pb-2" id="chapters-nav-stepper" aria-label="Chapters">
+          {Array.from({ length: TOTAL_CHAPTERS }, (_, i) => i + 1).map((num) => (
             <button
               key={num}
               onClick={() => jumpToChapter(num)}
+              aria-label={`Go to chapter ${num}${completedChapters[num] ? ' (completed)' : ''}`}
+              aria-current={currentChapter === num ? 'step' : undefined}
               className={`flex-1 min-w-[32px] h-2 rounded-full transition-all ${
                 currentChapter === num
-                  ? 'bg-stone-950 scale-102'
+                  ? 'bg-stone-950'
                   : completedChapters[num]
                   ? 'bg-emerald-500'
                   : 'bg-stone-100 hover:bg-stone-200'
@@ -161,150 +252,169 @@ export default function ChapterGuide({
               id={`step-jump-${num}`}
             />
           ))}
-        </div>
+        </nav>
 
-        {/* Narrative Headings */}
+        {/* Headings */}
         <div className="flex flex-col gap-1 mb-4">
           <span className="text-[10px] uppercase font-bold tracking-wider text-amber-600 font-sans flex items-center gap-1">
             <BookOpen className="w-3 h-3" />
-            <span>EXPLAINABLE ADVENTURES • CHAPTER {currentChapter} OF 7</span>
+            <span>
+              EXPLORABLE EXPLANATION &bull; CHAPTER {currentChapter} OF {TOTAL_CHAPTERS}
+            </span>
           </span>
-          <h1 className="text-2xl sm:text-3xl font-sans tracking-tight text-stone-900 font-bold" id="chapter-title">
-            {CHpText[currentChapter - 1].title}
-          </h1>
+          <h2 className="text-2xl sm:text-3xl font-sans tracking-tight text-stone-900 font-bold" id="chapter-title">
+            {chapter.title}
+          </h2>
           <p className="text-sm font-medium text-stone-500 italic" id="chapter-subtitle">
-            {CHpText[currentChapter - 1].subtitle}
+            {chapter.subtitle}
           </p>
         </div>
 
-        {/* Scrollable Story content */}
-        <div className="flex-1 overflow-y-auto pr-1 text-sm text-stone-700 leading-relaxed flex flex-col gap-4 mb-6 border-t border-b border-stone-100 py-6 max-h-[360px] lg:max-h-[500px]" id="chapter-story-body">
-          {CHpText[currentChapter - 1].paragraphs.map((para, pIdx) => (
+        {/* Story body */}
+        <div
+          className="flex-1 overflow-y-auto pr-1 text-sm text-stone-700 leading-relaxed flex flex-col gap-4 mb-6 border-t border-b border-stone-100 py-6 max-h-[360px] lg:max-h-[500px]"
+          id="chapter-story-body"
+        >
+          {chapter.paragraphs.map((para, pIdx) => (
             <p key={pIdx} className="leading-relaxed" dangerouslySetInnerHTML={{ __html: para }} />
           ))}
 
-          {/* Interactive 1D Toy embedded for Chapters 1 & 2 */}
+          {/* 1D toy for Chapters 1 & 2 */}
           {(currentChapter === 1 || currentChapter === 2) && (
-            <div className="bg-stone-50 p-4 rounded-2xl border border-stone-200/50 flex flex-col gap-3 mt-2" id="interactive-1d-diffusion-toy">
+            <div
+              className="bg-stone-50 p-4 rounded-2xl border border-stone-200/50 flex flex-col gap-3 mt-2"
+              id="interactive-1d-diffusion-toy"
+            >
               <span className="text-xs font-bold text-stone-800 uppercase tracking-wide flex items-center gap-1.5">
                 <Lightbulb className="w-4 h-4 text-amber-500" />
-                <span>Simulate 1D Molecular Diffusion</span>
+                <span>{reactionOn ? '1D Reaction + Diffusion' : '1D Diffusion Only'}</span>
               </span>
               <p className="text-xs text-stone-500">
-                Click cells to add Chemical concentration, then hit <strong>Diffusive Step</strong> to watch it smooth out!
+                {reactionOn
+                  ? 'Same diffusion as before, but now B also eats A to make more B. Step it and watch the peak sharpen and split instead of flattening.'
+                  : 'Click a cell to add activator B, then step. With no reaction, diffusion always smooths the profile towards a flat line.'}
               </p>
 
-              {/* Grid cell nodes */}
-              <div className="flex gap-1.5 justify-center mt-1">
-                {diffusionCells.map((val, idx) => (
+              <div className="flex gap-1.5 justify-center mt-1 items-end h-16">
+                {cellsB.map((val, idx) => (
                   <button
                     key={idx}
                     onClick={() => addConcentrationAt(idx)}
-                    className="flex-1 h-9 rounded-md border flex flex-col items-center justify-end overflow-hidden transition-all relative hover:border-amber-400 group"
-                    style={{
-                      backgroundColor: `rgba(239, 68, 68, ${val / 100})`, // redness based on concentration
-                      borderColor: val > 1 ? '#d6d3d1' : '#e7e5e4',
-                    }}
-                    title={`Cell concentration: ${val.toFixed(0)}%`}
+                    className="flex-1 h-full rounded-md border flex flex-col items-center justify-end overflow-hidden transition-all relative hover:border-amber-400 group bg-white"
+                    title={`Cell ${idx}: activator B = ${val.toFixed(2)}, substrate A = ${cellsA[idx].toFixed(2)}`}
+                    aria-label={`Add activator to cell ${idx}`}
                     id={`cell-1d-${idx}`}
                   >
-                    <span className="text-[9px] font-sans text-stone-600 font-bold mb-0.5 leading-none select-none z-10 group-hover:text-stone-900">
-                      {val.toFixed(0)}
+                    <span
+                      className="w-full transition-all"
+                      style={{ height: `${Math.max(2, val * 100)}%`, backgroundColor: '#ef4444' }}
+                    />
+                    <span className="absolute bottom-0.5 text-[9px] font-sans text-stone-700 font-bold leading-none select-none z-10">
+                      {(val * 100).toFixed(0)}
                     </span>
                   </button>
                 ))}
               </div>
 
-              {/* 1D Controllers */}
-              <div className="flex gap-2 justify-end">
-                <button
-                  onClick={resetDiffusion1D}
-                  className="px-2.5 py-1 text-[11px] font-bold text-stone-500 hover:text-stone-700 font-sans transition-all"
-                  id="reset-1d-btn"
-                >
-                  Clear cells
-                </button>
-                <button
-                  onClick={stepDiffusion1D}
-                  className="px-3.5 py-1.5 bg-neutral-900 border border-neutral-950 text-white hover:bg-neutral-800 rounded-lg text-xs font-bold font-sans flex items-center gap-1 transition-all shadow-sm"
-                  id="step-1d-btn"
-                >
-                  <RefreshCw className="w-3 h-3 animate-spin-slow" />
-                  <span>Diffusive Step →</span>
-                </button>
+              <div className="flex gap-2 justify-between items-center">
+                <span className="text-[10px] font-mono text-stone-500">
+                  step {stepCount} &bull; total B ={' '}
+                  <span className={reactionOn ? 'text-emerald-700 font-bold' : 'text-stone-700 font-bold'}>
+                    {totalB.toFixed(3)}
+                  </span>
+                  {reactionOn ? ' (can grow)' : ' (conserved)'}
+                </span>
+                <div className="flex gap-2">
+                  <button
+                    onClick={reset1D}
+                    className="px-2.5 py-1 text-[11px] font-bold text-stone-500 hover:text-stone-700 font-sans transition-all"
+                    id="reset-1d-btn"
+                  >
+                    Reset
+                  </button>
+                  <button
+                    onClick={step1D}
+                    className="px-3.5 py-1.5 bg-neutral-900 border border-neutral-950 text-white hover:bg-neutral-800 rounded-lg text-xs font-bold font-sans flex items-center gap-1 transition-all shadow-sm"
+                    id="step-1d-btn"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                    <span>Step &rarr;</span>
+                  </button>
+                </div>
               </div>
             </div>
           )}
 
-          {/* Chapters 3 to 6: Displays active Challenge box with gamified completion checks */}
-          {CHpText[currentChapter - 1].challenge && (
-            <div className={`p-4 rounded-2xl border flex flex-col gap-2.5 mt-2 transition-all ${
-              completedChapters[currentChapter]
-                ? 'bg-emerald-50/50 border-emerald-300 text-emerald-800'
-                : 'bg-amber-50/50 border-amber-300 text-amber-900'
-            }`} id="challenge-box">
+          {/* Challenge box */}
+          {chapter.challenge && (
+            <div
+              className={`p-4 rounded-2xl border flex flex-col gap-2.5 mt-2 transition-all ${
+                completedChapters[currentChapter]
+                  ? 'bg-emerald-50/50 border-emerald-300 text-emerald-800'
+                  : 'bg-amber-50/50 border-amber-300 text-amber-900'
+              }`}
+              id="challenge-box"
+            >
               <span className="text-xs font-bold uppercase tracking-wider flex items-center gap-1.5 font-sans">
                 {completedChapters[currentChapter] ? (
                   <Trophy className="w-4 h-4 text-emerald-600" />
                 ) : (
-                  <AlertCircle className="w-4 h-4 text-amber-600 font-bold" />
+                  <AlertCircle className="w-4 h-4 text-amber-600" />
                 )}
                 <span>DEVELOPMENTAL CHALLENGE</span>
               </span>
-              <p className="text-xs leading-relaxed">
-                {CHpText[currentChapter - 1].challenge?.prompt}
-              </p>
+              <p className="text-xs leading-relaxed">{chapter.challenge.prompt}</p>
 
-              {/* Dynamic suggestion tip */}
               {!completedChapters[currentChapter] && (
                 <div className="text-[11px] flex gap-1 bg-white/60 p-2 rounded-lg border border-amber-100 text-stone-600">
-                  <span className="font-semibold select-none text-amber-700 shrink-0">💡 HINT:</span>
-                  <span>{CHpText[currentChapter - 1].challenge?.hint}</span>
+                  <span className="font-semibold select-none text-amber-700 shrink-0">HINT:</span>
+                  <span>{chapter.challenge.hint}</span>
                 </div>
               )}
 
-              {/* Completion Ribbon Status */}
               <div className="flex items-center gap-2 mt-1 self-start">
                 {completedChapters[currentChapter] ? (
                   <div className="bg-emerald-500 text-white rounded-full px-3 py-1 text-xs font-bold flex items-center gap-1 shadow-sm font-sans animate-bounce-short">
-                    <Check className="w-3.5 h-3.5 border-1 rounded-full border-white" />
-                    <span>Challenge Unlocked!</span>
+                    <Check className="w-3.5 h-3.5" />
+                    <span>Pattern achieved!</span>
                   </div>
                 ) : (
                   <button
                     onClick={() => {
+                      // Apply the parameters the challenge asks for, then let the
+                      // simulation decide whether the challenge is met. The button
+                      // no longer force-marks the chapter complete.
                       if (currentChapter === 3) {
-                        // Quick calibrate spot preset
-                        onChangeTuringParams({ ...turingParams, feed: 0.035, kill: 0.062 });
+                        onChangeTuringParams({ ...turingParams, feed: 0.030, kill: 0.062 });
                       } else if (currentChapter === 4) {
-                        // Zebra stripes preset
-                        onChangeTuringParams({ ...turingParams, feed: 0.0545, kill: 0.062 });
+                        onChangeTuringParams({ ...turingParams, feed: 0.026, kill: 0.055 });
                       } else if (currentChapter === 5) {
-                        // Fern preset
                         onChangeLsystemParams({
                           ...lsystemParams,
                           axiom: 'X',
                           rules: [
                             { from: 'X', to: 'F+[[X]-X]-F[-FX]+X' },
-                            { from: 'F', to: 'FF' }
+                            { from: 'F', to: 'FF' },
                           ],
                           angle: 25,
+                          depth: 4,
                         });
                       } else if (currentChapter === 6) {
-                        // Symmetrical tree preset
+                        // FIXED: this used to apply the 22-degree bush preset,
+                        // directly contradicting a challenge that asks for 60 degrees.
                         onChangeLsystemParams({
                           ...lsystemParams,
-                          axiom: 'F',
-                          rules: [{ from: 'F', to: 'FF-[-F+F+F]+[+F-F-F]' }],
-                          angle: 22,
+                          axiom: 'F++F++F',
+                          rules: [{ from: 'F', to: 'F-F++F-F' }],
+                          angle: 60,
+                          depth: 3,
                         });
                       }
-                      setCompletedChapters(prev => ({ ...prev, [currentChapter]: true }));
                     }}
                     className="text-[10px] font-sans font-bold px-2.5 py-1 text-amber-700 hover:text-amber-900 border border-amber-300 hover:bg-amber-100/40 rounded-lg transition-all"
-                    id="bypass-challenge-btn"
+                    id="autocalibrate-btn"
                   >
-                    Auto-Calibrate DNA Presets 🧬
+                    Auto-calibrate parameters
                   </button>
                 )}
               </div>
@@ -312,7 +422,7 @@ export default function ChapterGuide({
           )}
         </div>
 
-        {/* Story Pagination bottom footer */}
+        {/* Pagination */}
         <div className="flex justify-between items-center gap-4 mt-auto pt-4 border-t border-stone-100" id="dialog-footer">
           <button
             onClick={handlePrev}
@@ -330,9 +440,9 @@ export default function ChapterGuide({
 
           <button
             onClick={handleNext}
-            disabled={currentChapter === 7}
+            disabled={currentChapter === TOTAL_CHAPTERS}
             className={`px-5 py-2.5 rounded-xl text-xs font-bold font-sans border flex items-center gap-1.5 transition-all shadow-sm ${
-              currentChapter === 7
+              currentChapter === TOTAL_CHAPTERS
                 ? 'opacity-30 border-stone-100 text-stone-400 cursor-not-allowed'
                 : 'bg-stone-900 border-stone-950 hover:bg-stone-800 text-white'
             }`}
@@ -344,39 +454,46 @@ export default function ChapterGuide({
         </div>
       </div>
 
-      {/* RIGHT COLUMN: Active interactive simulator matched with narrative needs */}
-      <div className="flex-1 w-full lg:w-7/12" id="active-sim-view-wrapper">
-        {currentChapter <= 4 ? (
-          /* Turing Morphogenesis 3D Playground (Chapters 1 to 4) */
+      {/* RIGHT COLUMN: active simulator */}
+      <div className="flex-1 w-full lg:w-7/12 flex flex-col gap-3" id="active-sim-view-wrapper">
+        {currentChapter === 7 && (
+          <div className="flex gap-2 bg-white border border-stone-200 rounded-2xl p-1.5" id="sandbox-engine-toggle">
+            {(['turing', 'lsystem'] as const).map((eng) => (
+              <button
+                key={eng}
+                onClick={() => setSandboxEngine(eng)}
+                className={`flex-1 py-2 rounded-xl text-xs font-bold transition-all ${
+                  sandboxEngine === eng
+                    ? 'bg-stone-900 text-white shadow-sm'
+                    : 'text-stone-600 hover:bg-stone-50'
+                }`}
+                id={`sandbox-toggle-${eng}`}
+              >
+                {eng === 'turing' ? 'Reaction-Diffusion' : 'L-System Growth'}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {showTuring ? (
           <TuringSim3D
             params={turingParams}
             onChangeParams={onChangeTuringParams}
-            chapterMode={true}
-            onChallengeSuccess={() => {
-              if (!completedChapters[currentChapter]) {
-                setCompletedChapters((prev) => ({ ...prev, [currentChapter]: true }));
-              }
-            }}
+            onChallengeSuccess={() => markComplete(currentChapter)}
             challengeCheck={(grid) => {
               if (currentChapter === 3) return evaluateTuringMatch(grid, 'spots');
-              if (currentChapter === 4) return evaluateTuringMatch(grid, 'stripes');
+              if (currentChapter === 4) return evaluateTuringMatch(grid, 'ridges');
               return false;
             }}
           />
         ) : (
-          /* L-Systems 3D Organic Branching (Chapters 5 to 7) */
           <LSystemSim3D
             params={lsystemParams}
             onChangeParams={onChangeLsystemParams}
-            chapterMode={true}
-            onChallengeSuccess={() => {
-              if (!completedChapters[currentChapter]) {
-                setCompletedChapters((prev) => ({ ...prev, [currentChapter]: true }));
-              }
-            }}
+            onChallengeSuccess={() => markComplete(currentChapter)}
             challengeCheck={(rules, angle) => {
-              if (currentChapter === 5) return evaluateLsystemMatch(rules, angle, 'fern');
-              if (currentChapter === 6) return evaluateLsystemMatch(rules, angle, 'snowflake');
+              if (currentChapter === 5) return evaluateLsystemMatch(rules, angle, 'branching');
+              if (currentChapter === 6) return evaluateLsystemMatch(rules, angle, 'symmetric');
               return false;
             }}
           />
@@ -386,90 +503,130 @@ export default function ChapterGuide({
   );
 }
 
-// Nicky Case styled chapters writing logic
-const CHpText = [
+// =============================================================================
+// Narrative text
+//
+// NOTE: these strings are injected with dangerouslySetInnerHTML, so they must
+// use plain HTML attributes. The original used React's `className=`, which
+// browsers ignore - every inline highlight in the text was silently unstyled.
+// =============================================================================
+const CODE = 'font-mono text-xs bg-stone-100 text-stone-800 px-1 rounded font-bold';
+
+const CHAPTERS: Chapter[] = [
   {
     title: 'The Symmetry Mystery',
-    subtitle: 'How does an embryo get its shape or spots?',
+    subtitle: 'How does an embryo decide where to put its spots?',
     paragraphs: [
-      'Every living thing begins as a single, perfectly symmetrical sphere: a fertilized cell or egg. This sphere divides, multiplying into a uniform, blank hollow ball of cells called a <strong>blastula</strong>.',
-      'But how does this blank sphere decide which side sprouts a leg, where the dark leopard spots land, or how stripes wrap neatly around a zebra’s ribs?',
-      'For centuries, scientists believed this pattern was pre-folded inside like origami. But in 1952, legendary mathematician <strong>Alan Turing</strong> proposed an elegant theory: <em>uniform chemicals diffusion can build patterns out of absolute symmetry.</em>',
-      '<strong>Play with the 1D toy below:</strong> Click cells to add chemical mass. Watch how it diffuses and evens out. Usually, diffusion smooths things out. But Turing found that adding reactions completely breaks this rule!',
+      'Many animal embryos start out looking almost featureless: a single cell divides into a hollow ball called a <strong>blastula</strong>. Zoom out far enough and it is nearly round, nearly uniform.',
+      '<em>Nearly.</em> Real eggs are rarely perfectly symmetric \u2014 frog and fruit-fly eggs carry maternal gradients laid down before fertilisation. But the puzzle stands: a handful of coarse cues cannot possibly specify the position of every leopard rosette or every stripe on a zebra\u2019s flank.',
+      'The nineteenth-century idea that the adult form was somehow pre-folded inside the egg (<em>preformationism</em>) had been abandoned long before, but by the 1940s biologists still tended to assume patterns were read off a pre-existing map. In 1952, <strong>Alan Turing</strong> proposed something stranger in <em>The Chemical Basis of Morphogenesis</em>: a chemical system with <em>no</em> map at all can generate one, because a uniform state can be <em>unstable</em>.',
+      'That should sound wrong. <strong>Play with the 1D toy below.</strong> Add some chemical to a cell and step it forward. Diffusion does exactly what you expect \u2014 it spreads things out, flattens peaks, and conserves the total. Watch the running total: it does not change.',
+      'So how do you get lumps out of a process whose entire job is removing lumps? Turing\u2019s answer is in the next chapter.',
     ],
   },
   {
-    title: 'Activators & Inhibitors',
-    subtitle: 'The yin and yang of chemical biology',
+    title: 'Activator & Substrate',
+    subtitle: 'Local self-amplification, long-range starvation',
     paragraphs: [
-      'In Turing’s model, two chemical keys compete in a delicate molecular ballet:',
-      '1. <strong>The Activator (Chemical B):</strong> Autocatalytic! It feeds on feedstock and makes MORE of itself. This represents a positive feedback loop.',
-      '2. <strong>The Inhibitor / Feeding Buffer (Chemical A):</strong> Created in response to chemical B, it dampens or shuts down chemical B’s production.',
-      'The cosmic secret lies in their <strong>diffusion speeds</strong>. If the Inhibitor diffuses <em>faster</em> than the Activator, a localized peak of Activator is prevented from spreading infinitely. It forms a stable, localized spot surrounded by a moat of Inhibitor!',
-      'This behavior is called <strong>local activation, lateral inhibition</strong>. Play with the 1D toy again, then shift to the 3D canvas of the egg/blastula on the right.',
+      'This simulation runs the <strong>Gray-Scott</strong> model, which has two chemicals with very different jobs:',
+      '1. <strong>Activator B</strong> \u2014 <em>autocatalytic</em>. B consumes A to make more B, in the reaction <span class="' +
+        CODE +
+        '">A + 2B &rarr; 3B</span>. More B means faster B production: a positive feedback loop.',
+      '2. <strong>Substrate A</strong> \u2014 the feedstock. It is <em>eaten</em> by the reaction and topped back up from a reservoir at the feed rate <span class="' +
+        CODE +
+        '">f</span>.',
+      '<strong>A common mix-up, worth getting right:</strong> A is not an inhibitor that B manufactures. Inhibition here is <em>indirect</em>. A patch of B strips the local A, and because <strong>A diffuses twice as fast as B</strong> (D<sub>A</sub>=1.0 vs D<sub>B</sub>=0.5), the starved zone spreads outward faster than the patch itself can. Each blob digs its own moat and keeps its neighbours away.',
+      'This is the principle of <strong>local activation with long-range inhibition</strong>. Gierer and Meinhardt (1972) achieved it with a genuinely separate inhibitor molecule; Gray-Scott achieves the same effect by <em>substrate depletion</em>. Either way, the fast-spreading species is the one that does the suppressing.',
+      '<strong>Now switch the reaction on in the toy below.</strong> Same diffusion, same starting bump \u2014 but the total no longer holds still, and the peak sharpens instead of flattening. That is symmetry-breaking in one dimension.',
     ],
   },
   {
-    title: 'Embryogenesis: Painting Spots',
-    subtitle: 'Triggering spots with reaction and clearance rates',
+    title: 'Painting Spots on a Sphere',
+    subtitle: 'Feed, kill, and the parameters that decide everything',
     paragraphs: [
-      'Now, let’s observe these reactions on a 3D developmental embryo! Right now, the simulation is running a classic Turing reaction-diffusion solver.',
-      'Try clicking and dragging directly on the 3D cell to <strong>paint droplets of high activator</strong>. Watch them branch out! If we calibrate Feed (<span className="font-mono text-xs bg-stone-100 text-stone-700 px-1 font-bold">f</span>) and Decay (<span className="font-mono text-xs bg-stone-100 text-stone-700 px-1 font-bold">k</span>) perfectly, the activator breaks symmetry on its own!',
-      '<strong>Your developmental challenge:</strong> Create leopard spots! Dial the feed rate smaller (<span className="font-mono text-stone-700">f ~ 0.035</span>) or activate the Leopard Spots preset. Help the embryo build isolated dots!',
+      'The right-hand panel runs the same equations on a 128&times;128 grid, wrapped onto a 3D body. Two numbers control the whole system:',
+      '<span class="' +
+        CODE +
+        '">f</span> (feed) sets how fast substrate A is replenished; <span class="' +
+        CODE +
+        '">k</span> (kill) sets how fast activator B is removed. B\u2019s total loss rate is actually <span class="' +
+        CODE +
+        '">f + k</span>, which is why the two dials interact rather than acting independently.',
+      'Try <strong>clicking and dragging on the body</strong> to paint activator. A blob that is too small dies out. Gray-Scott is <em>excitable</em>, not spontaneously unstable: unlike the textbook Turing instability, it will not pattern from an infinitesimal ripple \u2014 it needs a seed of finite size to get going. That is a real difference between this model and the one Turing analysed, and it is why the simulation starts you with a seeded blob rather than pure noise.',
+      '<strong>Challenge:</strong> produce isolated leopard spots. Around <span class="' +
+        CODE +
+        '">f = 0.030</span>, <span class="' +
+        CODE +
+        '">k = 0.062</span> each blob\u2019s moat is wide enough to stop it merging with its neighbours, and the surface settles into a lattice of separate dots.',
+      '<em>Caveat worth knowing:</em> the grid wraps around at all four edges, so the chemistry actually lives on a <strong>torus</strong> that is then painted onto whichever body you pick. Only the torus mesh is geometrically honest; on the sphere you will see stretching near the poles and a seam where the texture meets itself.',
     ],
     challenge: {
-      prompt: 'Successfully calibrate or paint the 3D blastula sphere to emerge into isolated "Leopard Spots"!',
-      hint: 'Bring parameters to: Feed (0.0350) and Decay/Kill (0.0620). Or use the "Auto-Calibrate DNA Presets" button below!',
+      prompt: 'Drive the surface into a field of separate, isolated spots \u2014 the challenge checks the actual pattern, not just your slider positions.',
+      hint: 'Try f \u2248 0.030 and k \u2248 0.062, then give it a few seconds to settle. Painting extra activator speeds things up.',
     },
   },
   {
-    title: 'The Zebra Ribs',
-    subtitle: 'Aligning droplets into stripes and labyrinth lines',
+    title: 'When Spots Become Ridges',
+    subtitle: 'And why real zebra stripes need something extra',
     paragraphs: [
-      'What if we want stripes instead? If active molecules are supplied with higher feedstocks or slower decay, spots will stretch, merge, and organize into <strong>concentric bands and stripes</strong>.',
-      'This process governs how zebra skins get marked, how desert sand dunes organize, and how brain coral grows standard maze-like ridges!',
-      '<strong>Paint directly on the cell</strong> to seed striped streams, and adjust the geometry of the embryo in the bottom selection from a blastula SPHERE to a cylinder (representing the growth axis of a growing leg/tail) or a torus!',
-      '<strong>Your developmental challenge:</strong> Form pristine Zebra Stripes! Adjust the sliders, or click the preset for stripes to achieve a banded state.',
+      'Lower the kill rate and each blob survives a little longer before its moat closes in. Spots stretch, touch, and fuse into long winding <strong>ridges</strong>.',
+      '<strong>Be honest about what you are seeing:</strong> Gray-Scott ridges are <em>labyrinthine</em> \u2014 they meander and branch like a maze or a brain-coral surface. They are not the parallel bands of a zebra. Getting stripes to line up requires an extra ingredient the model does not have on its own: a growth axis, a tissue that is much longer than it is wide, a pre-existing gradient, or anisotropic diffusion.',
+      'You can feel this yourself: switch the body to a <strong>cylinder</strong>. The geometry itself supplies a direction, and the ridges start to wrap around it.',
+      'How much of this happens in real animals is still an active question. Turing-like mechanisms are well supported in <em>zebrafish</em> stripes \u2014 though there the interaction is carried by direct contact between pigment cells rather than by diffusing morphogens (Nakamasu et al., 2009) \u2014 and in cat coat markings, where a reaction-diffusion prepattern involving DKK4 was identified in 2021. For zebras and leopards specifically, the reaction-diffusion account (Murray, 1981) remains a compelling hypothesis rather than a settled fact.',
+      '<em>One more correction to a claim you will see repeated:</em> sand dunes are also self-organising, but they are <strong>not</strong> reaction-diffusion. Dune fields come from a sediment-transport instability \u2014 same beautiful idea, different physics.',
     ],
     challenge: {
-      prompt: 'Transition the embryo chemical concentrations to create long, connected "Zebra Stripes" ridges.',
-      hint: 'Move Feed (f) to approximately 0.0545 and Decay/Kill (k) to approximately 0.0620.',
+      prompt: 'Merge the spots into connected, maze-like ridges covering a good fraction of the surface.',
+      hint: 'Try f \u2248 0.026 and k \u2248 0.055. If the surface goes blank, your kill rate is too high and the activator has died out.',
     },
   },
   {
-    title: 'Nature’s Branching DNA',
-    subtitle: 'Morphogenesis through recursive production codes',
+    title: 'Nature\u2019s Branching Grammar',
+    subtitle: 'L-systems: development as a rewriting rule',
     paragraphs: [
-      'Chemical gradients explain spots and skin textures, but what about the complex <em>structural</em> growth of skeletons, plant architectures, and ocean corals? ',
-      'In 1968, biologist <strong>Aristid Lindenmayer</strong> introduced <strong>L-Systems</strong>—a mathematical theory that models development as simple recursive code sequences.',
-      'Imagine a cell DNA having single string replacement rules: <em>"A branch must split into two branches every day."</em> In L-Systems, we write this as a rule: <span className="font-mono text-xs bg-stone-100 text-stone-700 px-1 font-bold">X → F+[[X]-X]-F[-FX]+X</span>.',
-      'On the right is a 3D branching seedling. Watch it sprout! <strong>Your challenge:</strong> Sprout the Classic Fern by ensuring the rule holds bracketed branches!',
+      'Chemistry explains skin markings. It does not explain the <em>architecture</em> of a fern frond or a coral colony. For that we need a different kind of model.',
+      'In 1968 the theoretical biologist <strong>Aristid Lindenmayer</strong> introduced <strong>L-systems</strong>. The defining feature is <em>parallel rewriting</em>: every symbol in the string is replaced at the same time, in every generation, the way every cell in a tissue divides on its own schedule. (This is what separates an L-system from an ordinary Chomsky grammar, where one symbol is rewritten at a time.)',
+      'Lindenmayer\u2019s originals described filamentous algae \u2014 one-dimensional chains of cells. The branching, turtle-graphics interpretation you are about to play with came later, largely through Przemys\u0142aw Prusinkiewicz, and is set out in <em>The Algorithmic Beauty of Plants</em> (1990).',
+      'A rule like <span class="' +
+        CODE +
+        '">X &rarr; F+[[X]-X]-F[-FX]+X</span> reads as: draw forward, turn, open a branch, recurse, close it, and so on. Four generations of that turns one symbol into hundreds of segments.',
+      '<strong>An analogy, not a mechanism:</strong> it is tempting to say "DNA is the rewriting rule." DNA does not rewrite strings. L-systems are a <em>descriptive</em> model \u2014 they capture the geometry that recursive, locally-identical growth produces, without claiming to be the biochemistry that implements it.',
+      '<strong>Challenge:</strong> grow something that actually branches. The grammar needs bracket pairs <span class="' +
+        CODE +
+        '">[ ]</span> to push and pop the turtle\u2019s state.',
     ],
     challenge: {
-      prompt: 'Program or calibrate a branching L-System structure that includes branching brackets [ ] and sprouts like a real fern!',
-      hint: 'Enable the "Classic Fern" preset or input [ ] rules and hit "Sprout Seed".',
+      prompt: 'Build a rule set containing bracketed side-branches, with a branch angle in a plant-like range.',
+      hint: 'Use the Fractal Plant preset, or write your own rule containing [ and ] and set the angle between 15\u00b0 and 45\u00b0.',
     },
   },
   {
-    title: 'Recursive Mathematical Crystals',
-    subtitle: 'Geometric fractals and the Koch snowflake',
+    title: 'Fractals Without Branches',
+    subtitle: 'The Koch snowflake \u2014 and what real snowflakes actually do',
     paragraphs: [
-      'L-Systems can also construct perfect crystalline geometries like snowflakes and fractals. In nature, this occurs when developmental branches grow symmetrically without a dominant vertical trunk (e.g. ice crystals, shell spirals).',
-      'By calibration of bifurcation angles to precise angles (like <span className="font-sans font-bold">60°</span>), we can break the organic randomness of a tree and form pristine geometric tiles!',
-      '<strong>Sprout the Snowflake:</strong> Update the bifurcation angle slider to exactly 60 degrees. Or tap the snowflake preset on the right.',
+      'Remove the brackets and the same machinery draws pure geometry. The axiom <span class="' +
+        CODE +
+        '">F++F++F</span> with the rule <span class="' +
+        CODE +
+        '">F &rarr; F-F++F-F</span> at <strong>60\u00b0</strong> gives the <strong>Koch snowflake</strong>: a closed curve of finite area and unbounded perimeter, with fractal dimension log4/log3 &asymp; 1.26.',
+      '<strong>Now the correction this chapter exists for.</strong> The Koch snowflake is <em>not</em> a model of a snowflake. Its self-similarity is imposed by hand, level by level. Real snow crystals grow by <strong>diffusion-limited solidification</strong>: water vapour diffuses toward the crystal, tips stick out into richer vapour and so grow faster, and the flat interface goes unstable (the Mullins-Sekerka instability).',
+      'That should sound familiar. A fast-diffusing resource being locally depleted, with the depletion suppressing growth nearby \u2014 it is the same logic as Chapter 2, running on ice instead of chemistry. The six-fold symmetry comes from the crystal lattice; the branching comes from the instability. Neither comes from a rewriting rule.',
+      'The honest summary: <strong>L-systems and reaction-diffusion are two different ways of getting complexity from simple local rules.</strong> One is a grammar, one is a physics. Nature uses something more like the second, but the first is often a far better <em>description</em> of the result.',
+      '<strong>Challenge:</strong> set the angle to exactly 60\u00b0 with a bracket-free rule.',
     ],
     challenge: {
-      prompt: 'Calibrate the L-System to grow with perfect geometric symmetry by settings the bifurcation angle to exactly 60° (or 45°)!',
-      hint: 'Move the bifurcation slider to 60° or trigger the Koch Snowflake preset.',
+      prompt: 'Grow the Koch snowflake: a rule with no bracketed branches, at exactly 60\u00b0.',
+      hint: 'Select the Koch Snowflake preset, or set the axiom to F++F++F, the rule to F-F++F-F, and the angle slider to 60\u00b0.',
     },
   },
   {
-    title: 'Grand Morphogenetic Sandbox',
-    subtitle: 'Play, edit DNA code, and design your 3D life-form!',
+    title: 'The Sandbox',
+    subtitle: 'Both engines, no rules',
     paragraphs: [
-      'Congratulations! You have completed the playable chapters of <strong>MorphoGenesis & Self-Organization</strong>!',
-      'You studied how Alan Turing’s reaction diffusion allows homogeneous chemical blocks to break symmetry forming spotted skin coats, and how Lindenmayer’s DNA strings organize beautiful 3D branches recursively.',
-      'Now, the timeline is fully in your hands. Feel free to navigate between Turing patterns and L-Systems using the panels. Paint on the 3D meshes, edit the DNA algebraic rules, tweak the timeline, and create your custom self-organized form!',
+      'That is the tour. You have seen two genuinely different routes from simple local rules to complex global form.',
+      '<strong>Reaction-diffusion:</strong> a uniform state that destroys itself, because a fast-spreading species suppresses a slow-spreading one that amplifies itself. Spots, ridges, mazes, and endlessly shifting waves fall out of two numbers.',
+      '<strong>L-systems:</strong> a string rewritten in parallel and read as drawing instructions, producing branching structures whose statistics look startlingly like real plants.',
+      'Use the toggle above the viewport to switch between them. Paint, edit the grammar, drag the sliders, break things. If you find a parameter pair that does something the chapters never mentioned, that is the point \u2014 both of these systems have regions nobody has catalogued.',
     ],
   },
 ];

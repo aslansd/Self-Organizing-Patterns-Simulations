@@ -1,20 +1,21 @@
-import React, { useEffect, useRef, useState } from 'react';
+import type React from 'react';
+import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
-import { Play, Pause, ChevronRight, RefreshCw, Layers, Grid, Sliders, CheckCircle, HelpCircle, TreePine } from 'lucide-react';
+import { RefreshCw, Layers, Grid, Sliders, HelpCircle, TreePine } from 'lucide-react';
 import { LSYSTEM_PRESETS, LSystemParameters } from '../types';
 
 interface LSystemSim3DProps {
   params: LSystemParameters;
   onChangeParams: (p: LSystemParameters) => void;
-  chapterMode?: boolean;
   onChallengeSuccess?: () => void;
   challengeCheck?: (rules: { from: string; to: string }[], angle: number) => boolean;
 }
 
+const MAX_STRING = 60000;
+
 export default function LSystemSim3D({
   params,
   onChangeParams,
-  chapterMode = false,
   onChallengeSuccess,
   challengeCheck,
 }: LSystemSim3DProps) {
@@ -23,18 +24,32 @@ export default function LSystemSim3D({
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const groupRef = useRef<THREE.Group | null>(null);
+  // Branch meshes in draw order, so the growth slider can reveal them by
+  // toggling visibility instead of rebuilding every geometry each frame.
+  const branchMeshesRef = useRef<THREE.Mesh[]>([]);
+  const bloomMeshesRef = useRef<THREE.Mesh[]>([]);
+  const sceneReady = useRef(false);
 
-  // Growth-time timeline sliders
   const [growthPercent, setGrowthPercent] = useState<number>(100);
   const [isGrowing, setIsGrowing] = useState<boolean>(false);
   const [activePreset, setActivePreset] = useState<string>('plant');
-  const [customRules, setCustomRules] = useState<{ from: string; to: string }[]>(params.rules);
+  const [segmentCount, setSegmentCount] = useState<number>(0);
 
-  // Re-seed orbit rotation variables
+  const growthRef = useRef(growthPercent);
+  const growingRef = useRef(isGrowing);
   const isMouseDownRef = useRef<boolean>(false);
   const mousePositionRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
 
-  // Generate expanded LSystem string from grammar
+  useEffect(() => {
+    growthRef.current = growthPercent;
+    growingRef.current = isGrowing;
+  });
+
+  // ---------------------------------------------------------------------------
+  // Parallel rewriting. Every symbol is replaced simultaneously each
+  // generation - that simultaneity is what makes this an L-system rather
+  // than an ordinary grammar.
+  // ---------------------------------------------------------------------------
   const expandLSystem = (axiom: string, rules: { from: string; to: string }[], depth: number): string => {
     let current = axiom;
     const ruleMap = new Map(rules.map((r) => [r.from, r.to]));
@@ -43,45 +58,54 @@ export default function LSystemSim3D({
       let expanded = '';
       for (let i = 0; i < current.length; i++) {
         const char = current[i];
-        if (ruleMap.has(char)) {
-          expanded += ruleMap.get(char);
-        } else {
-          expanded += char;
-        }
+        expanded += ruleMap.has(char) ? ruleMap.get(char) : char;
       }
       current = expanded;
-      // Safeguard against infinite growth or exponential explosions
-      if (current.length > 35000) {
-        current = current.slice(0, 35000);
+      if (current.length > MAX_STRING) {
+        // Truncate at a point where the bracket stack is balanced, so the
+        // turtle does not end up stranded inside an unclosed branch.
+        let depthCount = 0;
+        let cut = 0;
+        for (let i = 0; i < MAX_STRING; i++) {
+          if (current[i] === '[') depthCount++;
+          else if (current[i] === ']') depthCount--;
+          if (depthCount === 0) cut = i + 1;
+        }
+        current = current.slice(0, cut || MAX_STRING);
         break;
       }
     }
     return current;
   };
 
-  // Build 3D branches from the expanded L-Systems commands
-  const buildTreeGeometry = () => {
-    if (!sceneRef.current || !groupRef.current) return;
-
-    // Clear old branches
+  const disposeChildren = () => {
     const group = groupRef.current;
+    if (!group) return;
     while (group.children.length > 0) {
       const obj = group.children[0];
       group.remove(obj);
       if (obj instanceof THREE.Mesh) {
         obj.geometry.dispose();
-        if (Array.isArray(obj.material)) {
-          obj.material.forEach((m) => m.dispose());
-        } else {
-          obj.material.dispose();
-        }
+        if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
+        else obj.material.dispose();
       }
     }
+    branchMeshesRef.current = [];
+    bloomMeshesRef.current = [];
+  };
+
+  // ---------------------------------------------------------------------------
+  // Turtle interpretation
+  // ---------------------------------------------------------------------------
+  const buildTreeGeometry = () => {
+    const group = groupRef.current;
+    if (!sceneRef.current || !group) return;
+
+    disposeChildren();
 
     const expanded = expandLSystem(params.axiom, params.rules, params.depth);
     const angleRad = (params.angle * Math.PI) / 180;
 
-    // Turtle stack definitions
     interface TurtleState {
       position: THREE.Vector3;
       direction: THREE.Vector3;
@@ -93,27 +117,24 @@ export default function LSystemSim3D({
 
     const stack: TurtleState[] = [];
 
-    // Initial state
     let state: TurtleState = {
       position: new THREE.Vector3(0, -1.5, 0),
-      direction: new THREE.Vector3(0, 1, 0), // Pointing upwards
+      direction: new THREE.Vector3(0, 1, 0),
       up: new THREE.Vector3(0, 0, 1),
       right: new THREE.Vector3(1, 0, 0),
       width: params.width,
       length: params.length,
     };
 
-    // Keep track of the nodes/cylinders to support growth fraction animations
     interface BranchSegment {
       start: THREE.Vector3;
       end: THREE.Vector3;
       width: number;
+      endWidth: number;
       color: string;
-      order: number; // Order index from trunk to flowers
     }
 
     const segments: BranchSegment[] = [];
-    let stateHistoryIndex = 0;
 
     for (let i = 0; i < expanded.length; i++) {
       const char = expanded[i];
@@ -121,84 +142,83 @@ export default function LSystemSim3D({
       switch (char) {
         case 'F':
         case 'G': {
-          // Move forward and draw cylinder
           const prevPosition = state.position.clone();
-          const targetOffset = state.direction.clone().multiplyScalar(state.length);
-          const newPosition = prevPosition.clone().add(targetOffset);
+          const newPosition = prevPosition
+            .clone()
+            .add(state.direction.clone().multiplyScalar(state.length));
 
-          // Categorize branch types for natural coloring
-          let segmentColor = '#3f6212'; // Grass green default
+          const depthFraction = state.width / params.width; // 1 at trunk, ->0 at tips
+          let segmentColor = '#3f6212';
           if (params.colorTheme === 'coral') {
-            segmentColor = state.width > params.width * 0.4 ? '#f87171' : '#fca5a5';
+            segmentColor = depthFraction > 0.5 ? '#f87171' : '#fca5a5';
           } else if (params.colorTheme === 'forest') {
-            segmentColor = state.width > params.width * 0.35 ? '#854d0e' : '#22c55e';
+            segmentColor = depthFraction > 0.5 ? '#854d0e' : '#22c55e';
           } else if (params.colorTheme === 'glowing') {
-            segmentColor = state.width > params.width * 0.4 ? '#6366f1' : '#a855f7';
+            segmentColor = depthFraction > 0.5 ? '#6366f1' : '#a855f7';
           } else if (params.colorTheme === 'autumn') {
-            segmentColor = state.width > params.width * 0.45 ? '#a16207' : '#ea580c';
+            segmentColor = depthFraction > 0.5 ? '#a16207' : '#ea580c';
           }
 
           segments.push({
             start: prevPosition,
             end: newPosition,
             width: state.width,
+            endWidth: state.width * 0.92,
             color: segmentColor,
-            order: stateHistoryIndex++,
           });
 
           state.position = newPosition;
           break;
         }
         case 'f':
-        case 'g': {
-          // Move forward without drawing
+        case 'g':
           state.position.add(state.direction.clone().multiplyScalar(state.length));
           break;
-        }
         case '+': {
-          // Turn right around 'up' vector
           const q = new THREE.Quaternion().setFromAxisAngle(state.up, -angleRad);
           state.direction.applyQuaternion(q).normalize();
           state.right.applyQuaternion(q).normalize();
           break;
         }
         case '-': {
-          // Turn left around 'up' vector
           const q = new THREE.Quaternion().setFromAxisAngle(state.up, angleRad);
           state.direction.applyQuaternion(q).normalize();
           state.right.applyQuaternion(q).normalize();
           break;
         }
         case '&': {
-          // Pitch down around 'right' vector
           const q = new THREE.Quaternion().setFromAxisAngle(state.right, angleRad);
           state.direction.applyQuaternion(q).normalize();
           state.up.applyQuaternion(q).normalize();
           break;
         }
         case '^': {
-          // Pitch up around 'right' vector
           const q = new THREE.Quaternion().setFromAxisAngle(state.right, -angleRad);
           state.direction.applyQuaternion(q).normalize();
           state.up.applyQuaternion(q).normalize();
           break;
         }
         case '\\': {
-          // Roll right around 'direction' vector
           const q = new THREE.Quaternion().setFromAxisAngle(state.direction, angleRad);
           state.up.applyQuaternion(q).normalize();
           state.right.applyQuaternion(q).normalize();
           break;
         }
         case '/': {
-          // Roll left around 'direction' vector
           const q = new THREE.Quaternion().setFromAxisAngle(state.direction, -angleRad);
           state.up.applyQuaternion(q).normalize();
           state.right.applyQuaternion(q).normalize();
           break;
         }
         case '[': {
-          // Push State
+          // FIXED: taper on ENTERING a branch, and restore exactly on exit.
+          //
+          // The original applied width *= widthDecay and length *= lengthDecay
+          // AFTER popping. Because pops accumulate along the string, decay
+          // compounded with the running count of ']' rather than with nesting
+          // depth. For the Symmetric Bush preset that drove 3,652 of 4,096
+          // segments below the 0.001 render cutoff - roughly 89% of the plant
+          // was invisible.
           stack.push({
             position: state.position.clone(),
             direction: state.direction.clone(),
@@ -207,42 +227,28 @@ export default function LSystemSim3D({
             width: state.width,
             length: state.length,
           });
+          state.width *= params.widthDecay;
+          state.length *= params.lengthDecay;
           break;
         }
         case ']': {
-          // Pop State
           const popped = stack.pop();
-          if (popped) {
-            state = popped;
-            // Introduce a natural branch thinning and shortening on forks
-            state.width *= params.widthDecay;
-            state.length *= params.lengthDecay;
-          }
+          if (popped) state = popped;
           break;
         }
       }
     }
 
-    // Limit active segments rendered based on the dynamic timeline slider
-    const totalSelectedSegments = Math.floor((segments.length * growthPercent) / 100);
-    const renderableSegments = segments.slice(0, totalSelectedSegments);
+    setSegmentCount(segments.length);
 
-    // Render Cylinders
+    // Build every segment once. Growth is handled by visibility below.
     const materialCache = new Map<string, THREE.Material>();
 
-    renderableSegments.forEach((seg) => {
+    segments.forEach((seg) => {
       const height = seg.start.distanceTo(seg.end);
-      if (height < 0.001) return;
+      if (height < 0.0005) return;
 
-      const radialSegments = 6;
-      const geom = new THREE.CylinderGeometry(
-        seg.width * params.widthDecay, // top radius
-        seg.width, // bottom radius
-        height,
-        radialSegments
-      );
-
-      // Rotate and offset cylinder correctly between endpoints
+      const geom = new THREE.CylinderGeometry(seg.endWidth, seg.width, height, 6);
       geom.translate(0, height / 2, 0);
 
       let mat = materialCache.get(seg.color);
@@ -251,56 +257,73 @@ export default function LSystemSim3D({
           color: new THREE.Color(seg.color),
           roughness: 0.8,
           metalness: 0.1,
-          side: THREE.DoubleSide,
         });
         materialCache.set(seg.color, mat);
       }
 
       const branchMesh = new THREE.Mesh(geom, mat);
       branchMesh.position.copy(seg.start);
-
-      // Calculate vector offset quaternion to align the cylinder with direction flow
-      const upVec = new THREE.Vector3(0, 1, 0);
       const targetVec = new THREE.Vector3().subVectors(seg.end, seg.start).normalize();
-      const quat = new THREE.Quaternion().setFromUnitVectors(upVec, targetVec);
-      branchMesh.setRotationFromQuaternion(quat);
+      branchMesh.setRotationFromQuaternion(
+        new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), targetVec),
+      );
 
       group.add(branchMesh);
+      branchMeshesRef.current.push(branchMesh);
     });
 
-    // Make an aesthetic leaf/flower node at terminal ends for the top 15% nodes
-    const terminalCutoff = Math.floor(segments.length * 0.85);
-    const bloomColor = params.colorTheme === 'coral' ? '#f43f5e' : params.colorTheme === 'autumn' ? '#facc15' : params.colorTheme === 'glowing' ? '#f472b6' : '#86efac';
+    // Blooms on the final 15% of segments.
+    const bloomColor =
+      params.colorTheme === 'coral'
+        ? '#f43f5e'
+        : params.colorTheme === 'autumn'
+        ? '#facc15'
+        : params.colorTheme === 'glowing'
+        ? '#f472b6'
+        : '#86efac';
 
-    if (growthPercent > 80) {
-      const flowerGeom = new THREE.SphereGeometry(0.06, 6, 6);
-      const flowerMat = new THREE.MeshStandardMaterial({
-        color: new THREE.Color(bloomColor),
-        emissive: new THREE.Color(bloomColor).multiplyScalar(0.2),
-        roughness: 0.5,
-      });
+    const flowerGeom = new THREE.SphereGeometry(0.06, 6, 6);
+    const flowerMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(bloomColor),
+      emissive: new THREE.Color(bloomColor).multiplyScalar(0.2),
+      roughness: 0.5,
+    });
 
-      segments.slice(terminalCutoff, segments.length).forEach((seg) => {
-        const flowerMesh = new THREE.Mesh(flowerGeom, flowerMat);
-        flowerMesh.position.copy(seg.end);
-        group.add(flowerMesh);
-      });
-    }
+    segments.slice(Math.floor(segments.length * 0.85)).forEach((seg) => {
+      const flowerMesh = new THREE.Mesh(flowerGeom, flowerMat);
+      flowerMesh.position.copy(seg.end);
+      group.add(flowerMesh);
+      bloomMeshesRef.current.push(flowerMesh);
+    });
+
+    applyGrowthVisibility(growthRef.current);
   };
 
-  // Re-build 3D branch set when parameters or growth steps change
-  useEffect(() => {
-    buildTreeGeometry();
-  }, [params, growthPercent, params.colorTheme]);
+  const applyGrowthVisibility = (pct: number) => {
+    const meshes = branchMeshesRef.current;
+    const visibleCount = Math.floor((meshes.length * pct) / 100);
+    for (let i = 0; i < meshes.length; i++) meshes[i].visible = i < visibleCount;
+    const bloomsOn = pct > 80;
+    for (const m of bloomMeshesRef.current) m.visible = bloomsOn;
+  };
 
-  // Initial Scene loading for L-Systems
+  // ---------------------------------------------------------------------------
+  // Scene: created ONCE.
+  //
+  // The original had [isGrowing, params, chapterMode] as dependencies, so every
+  // slider tick destroyed and rebuilt the WebGLRenderer - and never called
+  // renderer.dispose(). Dragging the angle slider could allocate 30+ contexts
+  // in a second and trip the browser's ~16-context limit.
+  // ---------------------------------------------------------------------------
   useEffect(() => {
-    if (!containerRef.current) return;
-    const width = containerRef.current.clientWidth;
-    const height = Math.max(380, containerRef.current.clientHeight);
+    const container = containerRef.current;
+    if (!container) return;
+
+    const width = container.clientWidth || 600;
+    const height = Math.max(380, container.clientHeight);
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color('#faf9f6'); // Off-white clean easel
+    scene.background = new THREE.Color('#faf9f6');
     sceneRef.current = scene;
 
     const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 100);
@@ -310,41 +333,44 @@ export default function LSystemSim3D({
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setSize(width, height);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    containerRef.current.appendChild(renderer.domElement);
+    container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
-    scene.add(ambientLight);
-
-    const pointLight = new THREE.PointLight(0xfff5e6, 0.9, 50);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+    const pointLight = new THREE.PointLight(0xfff5e6, 40, 50);
     pointLight.position.set(2, 4, 3);
     scene.add(pointLight);
-
-    const backProjLight = new THREE.DirectionalLight(0xdbeafe, 0.4);
-    backProjLight.position.set(-3, -2, -2);
-    scene.add(backProjLight);
+    const backLight = new THREE.DirectionalLight(0xdbeafe, 0.4);
+    backLight.position.set(-3, -2, -2);
+    scene.add(backLight);
 
     const group = new THREE.Group();
     scene.add(group);
     groupRef.current = group;
+    sceneReady.current = true;
 
-    // Animation runner loop for rotators and growth cycles
-    let animId: number;
-    let autoGrowthSpeed = 1.2;
+    // FIXED: build the plant now. Previously the build effect was declared
+    // before this one, so on first mount it ran while groupRef was still null,
+    // returned early, and the viewport stayed empty until a control was touched.
+    buildTreeGeometry();
+
+    let animId = 0;
+    const autoGrowthSpeed = 1.2;
 
     const tick = () => {
       if (groupRef.current && !isMouseDownRef.current) {
-        groupRef.current.rotation.y += 0.0018; // Slowly rotate the tree
+        groupRef.current.rotation.y += 0.0018;
       }
 
-      if (isGrowing) {
-        setGrowthPercent((prev) => {
-          if (prev >= 100) {
-            setIsGrowing(false);
-            return 100;
-          }
-          return Math.min(100, prev + autoGrowthSpeed);
-        });
+      if (growingRef.current) {
+        const next = Math.min(100, growthRef.current + autoGrowthSpeed);
+        growthRef.current = next;
+        applyGrowthVisibility(next); // cheap: visibility only, no rebuild
+        if (next >= 100) {
+          growingRef.current = false;
+          setIsGrowing(false);
+        }
+        setGrowthPercent(next);
       }
 
       if (rendererRef.current && sceneRef.current && cameraRef.current) {
@@ -352,42 +378,70 @@ export default function LSystemSim3D({
       }
       animId = requestAnimationFrame(tick);
     };
-
     tick();
 
-    // Trigger challenge evaluator
-    if (chapterMode && challengeCheck && onChallengeSuccess) {
-      const isComplete = challengeCheck(params.rules, params.angle);
-      if (isComplete) {
-        onChallengeSuccess();
-      }
-    }
-
     const handleResize = () => {
-      if (!containerRef.current || !rendererRef.current || !cameraRef.current) return;
-      const w = containerRef.current.clientWidth;
-      const h = Math.max(380, containerRef.current.clientHeight);
+      if (!container || !rendererRef.current || !cameraRef.current) return;
+      const w = container.clientWidth || 600;
+      const h = Math.max(380, container.clientHeight);
       cameraRef.current.aspect = w / h;
       cameraRef.current.updateProjectionMatrix();
       rendererRef.current.setSize(w, h);
     };
-
     window.addEventListener('resize', handleResize);
 
     return () => {
       window.removeEventListener('resize', handleResize);
-      if (rendererRef.current && containerRef.current) {
-        try {
-          containerRef.current.removeChild(rendererRef.current.domElement);
-        } catch (_) {}
-      }
       cancelAnimationFrame(animId);
+      disposeChildren();
+      renderer.dispose();
+      renderer.forceContextLoss();
+      if (renderer.domElement.parentNode === container) {
+        container.removeChild(renderer.domElement);
+      }
+      sceneReady.current = false;
+      rendererRef.current = null;
+      groupRef.current = null;
     };
-  }, [isGrowing, params, chapterMode]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  // Orbit rotation controllers via standard pointer drag
+  // Rebuild geometry only when the grammar actually changes - not on every
+  // frame of the growth animation.
+  useEffect(() => {
+    if (sceneReady.current) buildTreeGeometry();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    params.axiom,
+    params.depth,
+    params.angle,
+    params.colorTheme,
+    params.width,
+    params.length,
+    params.widthDecay,
+    params.lengthDecay,
+    JSON.stringify(params.rules),
+  ]);
+
+  // Manual slider drags only need a visibility pass.
+  useEffect(() => {
+    applyGrowthVisibility(growthPercent);
+  }, [growthPercent]);
+
+  // Challenge evaluation. The original ran this inside the scene-setup effect,
+  // so it only fired when the renderer happened to be rebuilt.
+  useEffect(() => {
+    if (challengeCheck && onChallengeSuccess && challengeCheck(params.rules, params.angle)) {
+      onChallengeSuccess();
+    }
+  }, [params.rules, params.angle, challengeCheck, onChallengeSuccess]);
+
+  // ---------------------------------------------------------------------------
+  // Input
+  // ---------------------------------------------------------------------------
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     isMouseDownRef.current = true;
+    e.currentTarget.setPointerCapture(e.pointerId);
     mousePositionRef.current = { x: e.clientX, y: e.clientY };
   };
 
@@ -396,109 +450,117 @@ export default function LSystemSim3D({
     const deltaX = e.clientX - mousePositionRef.current.x;
     const deltaY = e.clientY - mousePositionRef.current.y;
     mousePositionRef.current = { x: e.clientX, y: e.clientY };
-
     groupRef.current.rotation.y += deltaX * 0.008;
     groupRef.current.rotation.x += deltaY * 0.008;
   };
 
-  const handlePointerUp = () => {
+  const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     isMouseDownRef.current = false;
-  };
-
-  // Preset setter helper
-  const applyPreset = (key: string) => {
-    const preset = LSYSTEM_PRESETS[key];
-    if (preset) {
-      setActivePreset(key);
-      onChangeParams({
-        ...params,
-        axiom: preset.axiom,
-        rules: preset.rules,
-        angle: preset.angle,
-        depth: preset.depth,
-      });
-      setCustomRules(preset.rules);
-      setGrowthPercent(0);
-      setIsGrowing(true); // Watch it sprout!
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
     }
   };
 
-  // Modify rule from interactive input fields
-  const handleRuleChange = (idx: number, toVal: string) => {
-    const updated = [...customRules];
-    updated[idx] = { ...updated[idx], to: toVal };
-    setCustomRules(updated);
+  const applyPreset = (key: string) => {
+    const preset = LSYSTEM_PRESETS[key];
+    if (!preset) return;
+    setActivePreset(key);
     onChangeParams({
       ...params,
-      rules: updated,
+      axiom: preset.axiom,
+      rules: preset.rules,
+      angle: preset.angle,
+      depth: preset.depth,
     });
+    setGrowthPercent(0);
+    growthRef.current = 0;
+    setIsGrowing(true);
+  };
+
+  // FIXED: edit params.rules directly. The original kept a `customRules` copy
+  // in local state that was never re-synced when the parent changed the rules,
+  // so after an auto-calibrate the editor displayed stale grammar.
+  const handleRuleChange = (idx: number, toVal: string) => {
+    const updated = params.rules.map((r, i) => (i === idx ? { ...r, to: toVal } : r));
+    setActivePreset('');
+    onChangeParams({ ...params, rules: updated });
   };
 
   const startGrowthCycle = () => {
     setGrowthPercent(0);
+    growthRef.current = 0;
     setIsGrowing(true);
   };
 
   return (
-    <div className="flex flex-col h-full bg-[#faf9f6]/40 rounded-2xl border border-stone-200/60 overflow-hidden shadow-sm md:sticky md:top-4" id="lsystem-playground">
-      {/* 3D Canvas Viewport */}
+    <div className="flex flex-col h-full bg-[#faf9f6]/40 rounded-2xl border border-stone-200/60 overflow-hidden shadow-sm" id="lsystem-playground">
       <div className="relative flex-1 bg-stone-50 overflow-hidden cursor-grab active:cursor-grabbing min-h-[340px]">
         <div
           ref={containerRef}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
-          className="w-full h-full"
+          onPointerCancel={handlePointerUp}
+          className="w-full h-full touch-none"
           id="lsystem-canvas"
         />
 
-        {/* Action Heads Up Displays */}
         <div className="absolute top-4 left-4 flex flex-col gap-2 z-10 pointer-events-none">
           <div className="bg-white/90 backdrop-blur-md border border-stone-100 px-3 py-1.5 rounded-full text-xs font-semibold text-stone-600 shadow-sm flex items-center gap-2">
             <TreePine className="w-3.5 h-3.5 text-emerald-600" />
-            <span>Drag to rotate, spin branching angles in 3D</span>
+            <span>Drag to rotate &bull; {segmentCount.toLocaleString()} segments</span>
           </div>
         </div>
 
-        {/* Seed trigger overlay */}
         <div className="absolute top-4 right-4 flex flex-col gap-2 z-10">
           <button
             onClick={startGrowthCycle}
             className="p-2.5 rounded-xl border bg-white hover:bg-emerald-50 hover:border-emerald-200 text-emerald-600 shadow-sm transition-all font-semibold flex items-center gap-1.5 text-xs"
-            title="Sprout Seed again"
+            title="Replay growth from the seed"
             id="sprout-btn"
           >
-            <RefreshCw className="w-4 h-4 animate-spin-slow" />
-            <span>Sprout Seed 🌿</span>
+            <RefreshCw className="w-4 h-4" />
+            <span>Sprout seed</span>
           </button>
         </div>
 
-        {/* Growth timeline HUD slider */}
-        <div className="absolute bottom-4 left-4 right-4 bg-white/95 backdrop-blur-md border border-stone-200/60 p-3 rounded-2xl shadow-lg flex flex-col gap-1.5 pointer-events-auto">
+        <div className="absolute bottom-4 left-4 right-4 bg-white/95 backdrop-blur-md border border-stone-200/60 p-3 rounded-2xl shadow-lg flex flex-col gap-1.5">
           <div className="flex justify-between text-xs font-medium">
-            <span className="text-stone-500 font-sans uppercase tracking-wider text-[10px] font-bold">Nature Developement Progression</span>
-            <span className="text-emerald-700 font-mono font-semibold">{growthPercent.toFixed(0)}% Mature</span>
+            <label
+              htmlFor="slider-growth-timeline"
+              className="text-stone-500 font-sans uppercase tracking-wider text-[10px] font-bold"
+            >
+              {/* FIXED typo: "Developement" */}
+              Development progression
+            </label>
+            <span className="text-emerald-700 font-mono font-semibold">
+              {growthPercent.toFixed(0)}% drawn
+            </span>
           </div>
           <input
             type="range"
-            min="1"
+            min="0"
             max="100"
             value={growthPercent}
-            onChange={(e) => setGrowthPercent(parseInt(e.target.value))}
+            onChange={(e) => {
+              setIsGrowing(false);
+              const v = parseInt(e.target.value);
+              growthRef.current = v;
+              setGrowthPercent(v);
+            }}
             className="w-full h-1 bg-stone-100 rounded-lg cursor-pointer accent-emerald-600"
             id="slider-growth-timeline"
           />
         </div>
       </div>
 
-      {/* Controller Parameters */}
+      {/* Controls */}
       <div className="bg-white p-4 border-t border-stone-200/60 flex flex-col gap-4">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {/* Presets selector */}
           <div className="flex flex-col gap-2">
             <label className="text-xs font-semibold text-stone-700 flex items-center gap-1">
               <Grid className="w-3.5 h-3.5 text-stone-500" />
-              <span>Plant Taxonomy / Presets</span>
+              <span>Grammar presets</span>
             </label>
             <div className="grid grid-cols-2 gap-1.5">
               {Object.keys(LSYSTEM_PRESETS).map((key) => (
@@ -510,19 +572,19 @@ export default function LSystemSim3D({
                       ? 'bg-stone-900 text-white border-stone-900 shadow-sm'
                       : 'bg-stone-50 hover:bg-stone-100 border-stone-200 text-stone-600'
                   }`}
+                  title={LSYSTEM_PRESETS[key].description}
                   id={`preset-lsystem-${key}`}
                 >
-                  🌴 {LSYSTEM_PRESETS[key].name}
+                  {LSYSTEM_PRESETS[key].name}
                 </button>
               ))}
             </div>
           </div>
 
-          {/* Color theme selections */}
           <div className="flex flex-col gap-2">
             <label className="text-xs font-semibold text-stone-700 flex items-center gap-1">
               <Sliders className="w-3.5 h-3.5 text-stone-500" />
-              <span>Somatic / Color palette</span>
+              <span>Colour palette</span>
             </label>
             <div className="grid grid-cols-2 gap-1.5">
               {(['forest', 'coral', 'glowing', 'autumn'] as const).map((theme) => (
@@ -536,41 +598,45 @@ export default function LSystemSim3D({
                   }`}
                   id={`theme-lsystem-${theme}`}
                 >
-                  🎨 {theme}
+                  {theme}
                 </button>
               ))}
             </div>
           </div>
         </div>
 
-        {/* L-System Grammatical Grammar editor */}
         <div className="pt-2 border-t border-stone-100 flex flex-col gap-2">
           <span className="text-xs font-semibold text-stone-700 flex items-center gap-1.5 mb-1">
             <Layers className="w-3.5 h-3.5 text-stone-500" />
-            <span>Interactive Developmental Rules (DNA Code)</span>
+            <span>Production rules</span>
           </span>
 
           <div className="flex gap-4 items-center">
-            <span className="text-xs text-stone-500 font-mono">Axiom (Seed):</span>
+            <label htmlFor="input-lsystem-axiom" className="text-xs text-stone-500 font-mono">
+              Axiom (seed):
+            </label>
             <input
               type="text"
               value={params.axiom}
-              onChange={(e) => onChangeParams({ ...params, axiom: e.target.value.toUpperCase() })}
-              className="px-2.5 py-1 text-xs font-mono rounded border border-stone-200 focus:outline-emerald-500 w-24 bg-stone-50"
+              /* FIXED: the original forced .toUpperCase(), which made the
+                 lowercase 'f' and 'g' move-without-drawing commands unusable. */
+              onChange={(e) => onChangeParams({ ...params, axiom: e.target.value })}
+              className="px-2.5 py-1 text-xs font-mono rounded border border-stone-200 focus:outline-emerald-500 w-32 bg-stone-50"
               placeholder="e.g. F"
               id="input-lsystem-axiom"
             />
           </div>
 
           <div className="flex flex-col gap-1.5">
-            {customRules.map((r, i) => (
+            {params.rules.map((r, i) => (
               <div key={i} className="flex gap-2 items-center text-xs font-mono">
                 <span className="bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded font-bold">{r.from}</span>
-                <span className="text-stone-400">→</span>
+                <span className="text-stone-400">&rarr;</span>
                 <input
                   type="text"
                   value={r.to}
                   onChange={(e) => handleRuleChange(i, e.target.value)}
+                  aria-label={`Production for ${r.from}`}
                   className="px-2.5 py-1 text-xs rounded border border-stone-200 focus:outline-emerald-500 flex-1 bg-stone-50"
                   id={`input-lsystem-rule-${i}`}
                 />
@@ -579,12 +645,15 @@ export default function LSystemSim3D({
           </div>
         </div>
 
-        {/* Tuning numbers dials */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 border-t border-stone-100">
           <div className="flex flex-col gap-1">
             <div className="flex justify-between items-center text-xs">
-              <span className="font-medium text-stone-500">Bifurcation Branch Angle</span>
-              <span className="font-mono text-stone-700 bg-stone-100 px-1.5 py-0.5 rounded font-semibold">{params.angle}°</span>
+              <label htmlFor="slider-lsystem-angle" className="font-medium text-stone-500">
+                Branch angle
+              </label>
+              <span className="font-mono text-stone-700 bg-stone-100 px-1.5 py-0.5 rounded font-semibold">
+                {params.angle}&deg;
+              </span>
             </div>
             <input
               type="range"
@@ -599,31 +668,45 @@ export default function LSystemSim3D({
 
           <div className="flex flex-col gap-1">
             <div className="flex justify-between items-center text-xs">
-              <span className="font-medium text-stone-500">Recursive Iteration Depth (Age)</span>
-              <span className="font-mono text-stone-700 bg-stone-100 px-1.5 py-0.5 rounded font-semibold">Generations: {params.depth}</span>
+              <label htmlFor="slider-lsystem-depth" className="font-medium text-stone-500">
+                Generations
+              </label>
+              <span className="font-mono text-stone-700 bg-stone-100 px-1.5 py-0.5 rounded font-semibold">
+                {params.depth}
+              </span>
             </div>
             <input
               type="range"
               min="1"
-              max="5"
+              max="6"
               value={params.depth}
               onChange={(e) => onChangeParams({ ...params, depth: parseInt(e.target.value) })}
               className="w-full h-1 accent-emerald-600 bg-stone-100 rounded-lg cursor-pointer"
               id="slider-lsystem-depth"
             />
             <p className="text-[9px] text-stone-400 leading-normal">
-              Warning: Each generation exponentially branches the plant complexity!
+              Each generation rewrites every symbol at once, so segment count grows exponentially.
             </p>
           </div>
         </div>
 
-        {/* Nicky Case style didactic tip text */}
         <div className="bg-stone-50 p-2.5 rounded-xl border border-stone-200/50 flex gap-2 items-start text-xs text-stone-600">
           <HelpCircle className="w-5 h-5 text-emerald-500 shrink-0 mt-0.5" />
           <div className="flex flex-col gap-0.5">
-            <span className="font-semibold text-stone-800 font-sans">Organic Instructions:</span>
+            <span className="font-semibold text-stone-800 font-sans">Turtle alphabet</span>
             <span className="leading-relaxed">
-              Use brackets <span className="font-mono bg-stone-100 px-0.5 text-stone-800">[</span> and <span className="font-mono bg-stone-100 px-0.5 text-stone-800">]</span> to establish side-branches! <span className="font-mono bg-stone-100 px-0.5 text-stone-800">+</span> tilts right, while <span className="font-mono bg-stone-100 px-0.5 text-stone-800">-</span> tilts left. Introduce <span className="font-mono bg-stone-100 text-stone-800 px-0.5">^</span> and <span className="font-mono bg-stone-100 text-stone-800 px-0.5">&amp;</span> for rich 3D volumes!
+              <span className="font-mono bg-stone-100 px-0.5 text-stone-800">F</span> draw forward,{' '}
+              <span className="font-mono bg-stone-100 px-0.5 text-stone-800">f</span> move without
+              drawing. <span className="font-mono bg-stone-100 px-0.5 text-stone-800">+</span> /{' '}
+              <span className="font-mono bg-stone-100 px-0.5 text-stone-800">-</span> turn,{' '}
+              <span className="font-mono bg-stone-100 px-0.5 text-stone-800">^</span> /{' '}
+              <span className="font-mono bg-stone-100 px-0.5 text-stone-800">&amp;</span> pitch,{' '}
+              <span className="font-mono bg-stone-100 px-0.5 text-stone-800">\</span> /{' '}
+              <span className="font-mono bg-stone-100 px-0.5 text-stone-800">/</span> roll (these
+              three make it genuinely 3D).{' '}
+              <span className="font-mono bg-stone-100 px-0.5 text-stone-800">[</span> /{' '}
+              <span className="font-mono bg-stone-100 px-0.5 text-stone-800">]</span> push and pop a
+              side branch. Any other letter is a silent placeholder that only exists to be rewritten.
             </span>
           </div>
         </div>
